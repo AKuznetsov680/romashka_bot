@@ -1,0 +1,31 @@
+name: TravelLine Daily Occupancy Report
+
+on:
+  schedule:
+    # 05:00 UTC = 08:00 МСК (Москва круглый год UTC+3)
+    - cron: '0 5 * * *'   # каждый день, включая выходные - отель принимает гостей всегда
+  workflow_dispatch: {}   # ручной запуск кнопкой "Run workflow"
+
+jobs:
+  send-report:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run report script
+        env:
+          TL_CLIENT_ID: ${{ secrets.TL_CLIENT_ID }}
+          TL_CLIENT_SECRET: ${{ secrets.TL_CLIENT_SECRET }}
+          TL_PROPERTY_ID: ${{ secrets.TL_PROPERTY_ID }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python travelline_daily_report.py
