@@ -28,4 +28,4 @@ jobs:
           TL_PROPERTY_ID: ${{ secrets.TL_PROPERTY_ID }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-        run: python travelline_daily_report.py
+        run: python travelline_daily_report_sale.py
