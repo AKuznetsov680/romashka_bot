@@ -1,37 +1,55 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Ежедневный отчёт по загрузке отеля (TravelLine Partner API) -> Telegram.
+Отчёт по загрузке отеля (TravelLine Partner API) -> Telegram.
 
-Источник данных: TravelLine Partner API, PMS Analytics API
-  GET /v1/properties/{propertyId}/daily-occupancy
-  https://www.travelline.ru/dev-portal/docs/api/#tag/PropertyAnalytics
+Что входит в отчёт:
+  1. Загрузка за вчерашний день (как раньше).
+  2. Сравнение последней полной недели (пн-вс) год к году:
+     эта неделя в этом году vs та же неделя ровно 52 недели назад.
+  3. Детализация по основным категориям номеров (room types) за последнюю
+     полную неделю: количество занятых номеро-ночей, выручка, % загрузки
+     по каждой категории.
 
-Авторизация: OAuth 2.0, Client Credentials Flow.
-  Токен выдаётся на 15 минут, обновление (refresh) не поддерживается -
-  каждый запуск скрипта получает новый токен.
+Источники данных (TravelLine Partner API):
+  - PMS Analytics API:     GET /v1/properties/{propertyId}/daily-occupancy
+  - PMS API (Property):    GET /v2/properties/{propertyId}/rooms
+  - PMS API (Reservation): GET /v2/properties/{propertyId}/reservations/search
+                            GET /v2/properties/{propertyId}/reservations/{number}
+  - Content API:           GET /v1/properties/{propertyId}   (названия категорий номеров)
+
+Авторизация: OAuth 2.0, Client Credentials Flow. Токен живёт 15 минут, без refresh -
+каждый запуск получает новый токен.
 
 Обязательные переменные окружения:
-  TL_CLIENT_ID        - client_id подключения TravelLine Partner API
-  TL_CLIENT_SECRET     - client_secret подключения TravelLine Partner API
-  TL_PROPERTY_ID       - ID средства размещения (отеля) в TravelLine
-  TELEGRAM_BOT_TOKEN
-  TELEGRAM_CHAT_ID
+  TL_CLIENT_ID, TL_CLIENT_SECRET, TL_PROPERTY_ID
+  TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
 
-Как получить TL_CLIENT_ID / TL_CLIENT_SECRET / TL_PROPERTY_ID - см. README.md.
+Ограничения этой версии (см. README.md):
+  - Детализация по категориям номеров строится через постраничный поиск
+    бронирований + запрос деталей по каждому - при очень большом количестве
+    броней за неделю обработка ограничена MAX_RESERVATIONS_TO_PROCESS,
+    чтобы не упереться в лимиты API и время выполнения.
+  - Выручка по категории номеров считается пропорционально числу ночей,
+    попадающих в отчётную неделю (простая пропорция, без учёта скидок/налогов
+    на уровне отдельных ночей).
 """
 
 import os
 import sys
 import time
-from datetime import datetime, timedelta
+from collections import defaultdict
+from datetime import datetime, timedelta, date
 
 import requests
 
 AUTH_URL = "https://partner.tlintegration.com/auth/token"
 ANALYTICS_BASE = "https://partner.tlintegration.com/api/pms-analytics"
 PMS_BASE = "https://partner.tlintegration.com/api/pms"
+CONTENT_BASE = "https://partner.tlintegration.com/api/content"
 REQUEST_TIMEOUT = 20
+
+MAX_RESERVATIONS_TO_PROCESS = 250  # защита от долгого выполнения / лимитов API
 
 
 # --------------------------------------------------------------------------
@@ -63,7 +81,47 @@ def auth_headers(token):
 
 
 # --------------------------------------------------------------------------
-# TravelLine: загрузка (occupancy)
+# TravelLine: справочники (категории номеров, номера)
+# --------------------------------------------------------------------------
+
+def get_room_type_names(token, property_id):
+    """Content API: id -> название категории номеров."""
+    url = f"{CONTENT_BASE}/v1/properties/{property_id}"
+    resp = requests.get(url, headers=auth_headers(token), timeout=REQUEST_TIMEOUT)
+    resp.raise_for_status()
+    data = resp.json()
+    room_types = data.get("roomTypes", []) or []
+    return {rt.get("id"): rt.get("name", rt.get("id")) for rt in room_types}
+
+
+def get_rooms(token, property_id):
+    """
+    PMS API: список номеров/люксов отеля с привязкой к категории (roomTypeId).
+    GET /v2/properties/{propertyId}/rooms - постраничный.
+    Возвращает список словарей {id, roomTypeId, displayName}.
+    """
+    url = f"{PMS_BASE}/v2/properties/{property_id}/rooms"
+    all_rooms = []
+    page_token = None
+    for _ in range(50):  # защита от бесконечной пагинации
+        params = {"maxPageSize": 100}
+        if page_token:
+            params["pageToken"] = page_token
+        resp = requests.get(url, params=params, headers=auth_headers(token),
+                             timeout=REQUEST_TIMEOUT)
+        resp.raise_for_status()
+        data = resp.json()
+        all_rooms.extend(data.get("rooms", []))
+        if not data.get("hasNextPage"):
+            break
+        page_token = data.get("nextPageToken")
+        if not page_token:
+            break
+    return all_rooms
+
+
+# --------------------------------------------------------------------------
+# TravelLine: загрузка по дням (PMS Analytics API)
 # --------------------------------------------------------------------------
 
 def get_daily_occupancy(token, property_id, start_date, end_date):
@@ -82,103 +140,290 @@ def get_daily_occupancy(token, property_id, start_date, end_date):
     return resp.json()
 
 
-def get_total_rooms_count(token, property_id):
+def aggregate_week(token, property_id, start_date, end_date):
     """
-    Общее количество номеров отеля (для расчёта % загрузки).
-    GET /v2/properties/{propertyId}/rooms - постраничный список.
-    Если получить не удалось - возвращает None (в отчёте просто не будет %).
+    Суммирует показатели daily-occupancy за диапазон дат (неделю).
+    Возвращает dict с суммами + список предупреждений API (если были).
     """
-    url = f"{PMS_BASE}/v2/properties/{property_id}/rooms"
-    total = 0
+    data = get_daily_occupancy(token, property_id, start_date.isoformat(), end_date.isoformat())
+    days = data.get("dailyOccupancies") or data.get("days") or []
+    warnings = data.get("warnings") or []
+
+    sums = {
+        "occupied_room_nights": 0,
+        "closed_room_nights": 0,
+        "arrivals": 0,
+        "guests": 0,
+        "revenue": 0.0,
+        "room_revenue": 0.0,
+        "meal_revenue": 0.0,
+        "days_with_data": 0,
+    }
+    for day in days:
+        sums["days_with_data"] += 1
+        sums["occupied_room_nights"] += day.get("occupancyRoomCount") or 0
+        sums["closed_room_nights"] += day.get("closedRoomCount") or 0
+        sums["arrivals"] += day.get("arrivalCount") or 0
+        sums["guests"] += day.get("guestCount") or 0
+        sums["revenue"] += day.get("revenue") or 0
+        sums["room_revenue"] += day.get("roomRevenue") or 0
+        sums["meal_revenue"] += day.get("mealRevenue") or 0
+
+    return sums, warnings
+
+
+# --------------------------------------------------------------------------
+# TravelLine: детализация по категориям номеров (через бронирования)
+# --------------------------------------------------------------------------
+
+def search_active_reservation_numbers(token, property_id, start_dt, end_dt):
+    """
+    PMS API: GET /v2/properties/{propertyId}/reservations/search
+    Возвращает номера активных броней, затрагивающих период [start_dt, end_dt].
+    """
+    url = f"{PMS_BASE}/v2/properties/{property_id}/reservations/search"
+    numbers = []
     page_token = None
-    for _ in range(50):  # защита от бесконечной пагинации
-        params = {"maxPageSize": 100}
+    for _ in range(50):
         if page_token:
-            params["pageToken"] = page_token
+            params = {"pageToken": page_token}  # при токене остальные параметры игнорируются
+        else:
+            params = {
+                "state": "Active",
+                "startAffectPeriodDateTime": start_dt.strftime("%Y-%m-%dT%H:%M"),
+                "endAffectPeriodDateTime": end_dt.strftime("%Y-%m-%dT%H:%M"),
+                "maxPageSize": 100,
+            }
         resp = requests.get(url, params=params, headers=auth_headers(token),
                              timeout=REQUEST_TIMEOUT)
         resp.raise_for_status()
         data = resp.json()
-        rooms = data.get("rooms", [])
-        total += len(rooms)
-        if not data.get("hasNextPage"):
+        numbers.extend(r.get("number") for r in data.get("reservations", []) if r.get("number"))
+        if len(numbers) >= MAX_RESERVATIONS_TO_PROCESS or not data.get("hasNextPage"):
             break
         page_token = data.get("nextPageToken")
         if not page_token:
             break
-    return total or None
+    return numbers[:MAX_RESERVATIONS_TO_PROCESS]
+
+
+def get_reservation_details(token, property_id, number):
+    url = f"{PMS_BASE}/v2/properties/{property_id}/reservations/{number}"
+    resp = requests.get(url, headers=auth_headers(token), timeout=REQUEST_TIMEOUT)
+    resp.raise_for_status()
+    return resp.json().get("reservation", {})
+
+
+def nights_overlap(check_in, check_out, week_start, week_end_exclusive):
+    """Число ночей проживания, попадающих в [week_start, week_end_exclusive)."""
+    lo = max(check_in, week_start)
+    hi = min(check_out, week_end_exclusive)
+    return max((hi - lo).days, 0)
+
+
+def get_room_type_breakdown(token, property_id, room_id_to_type, week_start, week_end):
+    """
+    Детализация по категориям номеров за неделю [week_start, week_end] (включительно).
+    Возвращает dict: roomTypeId -> {"nights": int, "revenue": float, "reservations": int}
+    и флаг was_capped (упёрлись ли в лимит обрабатываемых броней).
+    """
+    week_start_dt = datetime.combine(week_start, datetime.min.time())
+    week_end_exclusive_dt = datetime.combine(week_end + timedelta(days=1), datetime.min.time())
+
+    numbers = search_active_reservation_numbers(token, property_id, week_start_dt, week_end_exclusive_dt)
+    was_capped = len(numbers) >= MAX_RESERVATIONS_TO_PROCESS
+
+    breakdown = defaultdict(lambda: {"nights": 0, "revenue": 0.0, "reservations": 0})
+
+    for number in numbers:
+        try:
+            reservation = get_reservation_details(token, property_id, number)
+        except Exception:
+            continue  # пропускаем единичные сбои, не прерываем весь отчёт
+        time.sleep(0.05)  # бережём лимиты API
+
+        for room_stay in reservation.get("roomStays", []):
+            room_id = room_stay.get("roomId")
+            room_type_id = room_id_to_type.get(room_id, room_stay.get("roomTypeId", "unknown"))
+
+            try:
+                check_in = datetime.fromisoformat(room_stay["checkInDateTime"]).date()
+                check_out = datetime.fromisoformat(room_stay["checkOutDateTime"]).date()
+            except (KeyError, ValueError):
+                continue
+
+            total_nights = max((check_out - check_in).days, 1)
+            nights_in_week = nights_overlap(
+                datetime.combine(check_in, datetime.min.time()),
+                datetime.combine(check_out, datetime.min.time()),
+                week_start_dt, week_end_exclusive_dt,
+            )
+            if nights_in_week <= 0:
+                continue
+
+            total_price = (room_stay.get("totalPrice", {}) or {}).get("amount", {}).get("value")
+            revenue_share = (total_price or 0) * nights_in_week / total_nights
+
+            entry = breakdown[room_type_id]
+            entry["nights"] += nights_in_week
+            entry["revenue"] += revenue_share
+            entry["reservations"] += 1
+
+    return dict(breakdown), was_capped
+
+
+# --------------------------------------------------------------------------
+# Вспомогательное: диапазоны дат
+# --------------------------------------------------------------------------
+
+def get_last_full_week(reference_date=None):
+    """Последняя полная неделя (понедельник-воскресенье), закончившаяся до сегодня."""
+    today = reference_date or date.today()
+    days_since_monday = today.weekday()  # Monday = 0
+    last_sunday = today - timedelta(days=days_since_monday + 1)
+    last_monday = last_sunday - timedelta(days=6)
+    return last_monday, last_sunday
 
 
 # --------------------------------------------------------------------------
 # Формирование отчёта
 # --------------------------------------------------------------------------
 
-def format_money(value, currency=""):
+def format_money(value):
     if value is None:
         return "н/д"
     try:
-        return f"{float(value):,.0f} {currency}".replace(",", " ").strip()
+        return f"{float(value):,.0f}".replace(",", " ")
     except (ValueError, TypeError):
         return str(value)
 
 
-def build_report_section(occupancy_data, total_rooms, report_date):
-    lines = [f"<b>🏨 Загрузка отеля — {report_date}</b>"]
+def format_delta_pct(current, previous):
+    if not previous:
+        return ""
+    delta = 100 * (current - previous) / previous
+    sign = "+" if delta >= 0 else ""
+    arrow = "🟢" if delta >= 0 else "🔴"
+    return f" {arrow} {sign}{delta:.0f}%"
 
+
+def build_yesterday_section(occupancy_data, total_rooms, report_date):
+    lines = [f"<b>🏨 Загрузка отеля — {report_date}</b>"]
     days = occupancy_data.get("dailyOccupancies") or occupancy_data.get("days") or []
     warnings = occupancy_data.get("warnings") or []
 
-    if warnings:
-        for w in warnings:
-            code = w.get("code", "")
-            msg = w.get("message", "")
-            lines.append(f"⚠️ {code}: {msg}")
+    for w in warnings:
+        lines.append(f"⚠️ {w.get('code', '')}: {w.get('message', '')}")
 
     if not days:
         lines.append("Нет данных за указанный период.")
         return "\n".join(lines)
 
-    # Обычно данные за один день (startStayDate == endStayDate == вчера)
-    for day in days:
-        date = day.get("date", report_date)
-        occupied = day.get("occupancyRoomCount")
-        complimentary = day.get("complimentaryOccupancyRoomCount")
-        closed = day.get("closedRoomCount")
-        revenue = day.get("revenue")
-        room_revenue = day.get("roomRevenue")
-        meal_revenue = day.get("mealRevenue")
-        arrivals = day.get("arrivalCount")
-        guests = day.get("guestCount")
+    day = days[0]
+    occupied = day.get("occupancyRoomCount")
+    complimentary = day.get("complimentaryOccupancyRoomCount")
+    closed = day.get("closedRoomCount")
 
-        lines.append(f"\n📅 <b>{date}</b>")
+    if occupied is not None:
+        occ_line = f"🛏 Занято номеров: {occupied}"
+        if complimentary:
+            occ_line += f" (+ {complimentary} без оплаты)"
+        if total_rooms:
+            available = max(total_rooms - (closed or 0), 1)
+            pct = 100 * occupied / available
+            occ_line += f" — загрузка {pct:.0f}%"
+        lines.append(occ_line)
 
-        if occupied is not None:
-            occ_line = f"🛏 Занято номеров: {occupied}"
-            if complimentary:
-                occ_line += f" (+ {complimentary} без оплаты)"
-            if total_rooms:
-                available = max(total_rooms - (closed or 0), 1)
-                pct = 100 * occupied / available
-                occ_line += f" — загрузка {pct:.0f}% (из {available} доступных, всего {total_rooms})"
-            lines.append(occ_line)
+    if day.get("arrivalCount") is not None:
+        lines.append(f"🚪 Заезды: {day['arrivalCount']}")
+    if day.get("guestCount") is not None:
+        lines.append(f"👥 Гостей: {day['guestCount']}")
+    if day.get("revenue") is not None:
+        lines.append(f"💰 Выручка за день: {format_money(day['revenue'])}")
 
-        if closed is not None:
-            lines.append(f"🔧 Номера не в эксплуатации: {closed}")
+    return "\n".join(lines)
 
-        if arrivals is not None:
-            lines.append(f"🚪 Заезды за день: {arrivals}")
 
-        if guests is not None:
-            lines.append(f"👥 Гостей: {guests}")
+def build_yoy_section(this_week, this_week_sums, last_year_week, last_year_sums,
+                       this_warnings, last_warnings, total_rooms):
+    lines = [
+        "<b>📊 Сравнение недель, год к году</b>",
+        f"Эта неделя: {this_week[0].isoformat()} — {this_week[1].isoformat()}",
+        f"Та же неделя год назад: {last_year_week[0].isoformat()} — {last_year_week[1].isoformat()}",
+        "",
+    ]
 
-        if revenue is not None:
-            lines.append(f"💰 Выручка отеля за день: {format_money(revenue)}")
+    for w in (this_warnings or []):
+        lines.append(f"⚠️ (текущая неделя) {w.get('code', '')}: {w.get('message', '')}")
+    for w in (last_warnings or []):
+        lines.append(f"⚠️ (неделя год назад) {w.get('code', '')}: {w.get('message', '')}")
 
-        if room_revenue is not None:
-            lines.append(f"   • по номерам: {format_money(room_revenue)}")
+    def occ_pct(sums):
+        if not total_rooms or sums["days_with_data"] == 0:
+            return None
+        available_nights = max(total_rooms * sums["days_with_data"] - sums["closed_room_nights"], 1)
+        return 100 * sums["occupied_room_nights"] / available_nights
 
-        if meal_revenue is not None:
-            lines.append(f"   • по питанию: {format_money(meal_revenue)}")
+    this_pct = occ_pct(this_week_sums)
+    last_pct = occ_pct(last_year_sums)
+
+    if this_pct is not None and last_pct is not None:
+        lines.append(
+            f"🛏 Загрузка: {this_pct:.0f}% vs {last_pct:.0f}% год назад"
+            f"{format_delta_pct(this_pct, last_pct)}"
+        )
+    else:
+        lines.append(
+            f"🛏 Занятые номеро-ночи: {this_week_sums['occupied_room_nights']} "
+            f"vs {last_year_sums['occupied_room_nights']} год назад"
+            f"{format_delta_pct(this_week_sums['occupied_room_nights'], last_year_sums['occupied_room_nights'])}"
+        )
+
+    lines.append(
+        f"🚪 Заезды: {this_week_sums['arrivals']} vs {last_year_sums['arrivals']} год назад"
+        f"{format_delta_pct(this_week_sums['arrivals'], last_year_sums['arrivals'])}"
+    )
+    lines.append(
+        f"👥 Гости: {this_week_sums['guests']} vs {last_year_sums['guests']} год назад"
+        f"{format_delta_pct(this_week_sums['guests'], last_year_sums['guests'])}"
+    )
+    lines.append(
+        f"💰 Выручка: {format_money(this_week_sums['revenue'])} "
+        f"vs {format_money(last_year_sums['revenue'])} год назад"
+        f"{format_delta_pct(this_week_sums['revenue'], last_year_sums['revenue'])}"
+    )
+
+    return "\n".join(lines)
+
+
+def build_room_type_section(breakdown, room_type_names, rooms_per_type, week_start, week_end, was_capped):
+    lines = [
+        "<b>🏷 Детализация по категориям номеров</b>",
+        f"Неделя: {week_start.isoformat()} — {week_end.isoformat()}",
+    ]
+    if was_capped:
+        lines.append(
+            f"⚠️ Обработано максимум {MAX_RESERVATIONS_TO_PROCESS} броней - "
+            f"при очень высокой загрузке цифры ниже могут быть неполными."
+        )
+
+    if not breakdown:
+        lines.append("Нет данных по бронированиям за эту неделю.")
+        return "\n".join(lines)
+
+    days_in_week = (week_end - week_start).days + 1
+    # Сортируем по выручке, чтобы важные категории были выше
+    for room_type_id, stats in sorted(breakdown.items(), key=lambda kv: -kv[1]["revenue"]):
+        name = room_type_names.get(room_type_id, f"Категория {room_type_id}")
+        rooms_count = rooms_per_type.get(room_type_id)
+        lines.append(f"\n<b>{name}</b>")
+        lines.append(f"  Занято номеро-ночей: {stats['nights']}")
+        if rooms_count:
+            available_nights = rooms_count * days_in_week
+            pct = 100 * stats["nights"] / available_nights if available_nights else 0
+            lines.append(f"  Загрузка категории: {pct:.0f}% (из {rooms_count} номеров)")
+        lines.append(f"  Выручка: {format_money(stats['revenue'])}")
+        lines.append(f"  Бронирований, затрагивающих неделю: {stats['reservations']}")
 
     return "\n".join(lines)
 
@@ -223,7 +468,7 @@ def main():
               file=sys.stderr)
         sys.exit(1)
 
-    yesterday = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
+    yesterday = (datetime.now() - timedelta(days=1)).date()
 
     try:
         token = get_access_token(client_id, client_secret)
@@ -231,26 +476,73 @@ def main():
         print(f"[!] Ошибка авторизации в TravelLine: {e}", file=sys.stderr)
         sys.exit(1)
 
+    # --- справочники (не критичны: при сбое просто теряем % и названия) ---
     try:
-        occupancy_data = get_daily_occupancy(token, property_id, yesterday, yesterday)
+        rooms = get_rooms(token, property_id)
+        total_rooms = len(rooms) or None
+        room_id_to_type = {r.get("id"): r.get("roomTypeId") for r in rooms}
+        rooms_per_type = defaultdict(int)
+        for r in rooms:
+            rooms_per_type[r.get("roomTypeId")] += 1
+    except Exception:
+        total_rooms = None
+        room_id_to_type = {}
+        rooms_per_type = {}
+
+    try:
+        room_type_names = get_room_type_names(token, property_id)
+    except Exception:
+        room_type_names = {}
+
+    # --- вчера ---
+    try:
+        occupancy_data = get_daily_occupancy(token, property_id, yesterday.isoformat(), yesterday.isoformat())
     except Exception as e:
         occupancy_data = {"warnings": [{"code": "FetchError", "message": str(e)}]}
+    yesterday_section = build_yesterday_section(occupancy_data, total_rooms, yesterday.isoformat())
+
+    # --- YoY по неделям ---
+    this_week = get_last_full_week()
+    last_year_week = (this_week[0] - timedelta(days=364), this_week[1] - timedelta(days=364))
 
     try:
-        total_rooms = get_total_rooms_count(token, property_id)
-    except Exception:
-        total_rooms = None  # необязательные данные, отчёт не критичен без них
+        this_week_sums, this_warnings = aggregate_week(token, property_id, *this_week)
+    except Exception as e:
+        this_week_sums = defaultdict(int)
+        this_warnings = [{"code": "FetchError", "message": str(e)}]
 
-    report_text = build_report_section(occupancy_data, total_rooms, yesterday)
+    try:
+        last_year_sums, last_warnings = aggregate_week(token, property_id, *last_year_week)
+    except Exception as e:
+        last_year_sums = defaultdict(int)
+        last_warnings = [{"code": "FetchError", "message": str(e)}]
 
-    print(report_text.replace("<b>", "").replace("</b>", ""))  # локальный лог
+    yoy_section = build_yoy_section(this_week, this_week_sums, last_year_week, last_year_sums,
+                                     this_warnings, last_warnings, total_rooms)
+
+    # --- детализация по категориям номеров за последнюю неделю ---
+    try:
+        breakdown, was_capped = get_room_type_breakdown(
+            token, property_id, room_id_to_type, this_week[0], this_week[1]
+        )
+    except Exception as e:
+        breakdown, was_capped = {}, False
+        print(f"[!] Не удалось получить детализацию по категориям номеров: {e}", file=sys.stderr)
+
+    room_type_section = build_room_type_section(
+        breakdown, room_type_names, rooms_per_type, this_week[0], this_week[1], was_capped
+    )
+
+    full_report = "\n\n".join([yesterday_section, yoy_section, room_type_section])
+
+    print(full_report.replace("<b>", "").replace("</b>", "").replace("<u>", "").replace("</u>", ""))
 
     if not tg_token or not tg_chat_id:
         print("\n[!] TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID не заданы - "
               "сообщение не отправлено, только выведено выше.", file=sys.stderr)
         return
 
-    send_telegram_message(tg_token, tg_chat_id, report_text)
+    send_telegram_message(tg_token, tg_chat_id, full_report)
     print("\n[OK] Отправлено в Telegram.")
 
 
