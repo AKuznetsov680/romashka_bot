@@ -1,4 +1,4 @@
-name: TravelLine Daily Occupancy Report
+name: TravelLine Sale Report
 
 on:
   schedule:
